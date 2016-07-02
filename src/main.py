@@ -2,7 +2,6 @@ from __future__ import print_function
 
 import codecs
 from collections import Counter
-import random
 
 import matplotlib
 matplotlib.use('Agg')
@@ -11,179 +10,16 @@ import seaborn as sns
 
 import numpy as np
 
-from keras.layers import Input
-from keras.layers.core import Activation, Reshape, Flatten, Dense
-from keras.layers.embeddings import Embedding
-from keras.optimizers import SGD, RMSprop, Adam
-from keras.layers import merge
-from keras.models import Sequential, Model
 from keras.utils import np_utils
-from keras.layers.recurrent import LSTM
 from keras import backend as K
 
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.manifold import TSNE
 
+from utils import index_characters, vectorize_tokens
+from word2vec import make_sampling_table, skipgrams
+from model import build_model
 
-def make_sampling_table(size, sampling_factor=1e-5):
-    """
-          This generates an array where the ith element
-          is the probability that a word of rank i would be sampled,
-          according to the sampling distribution used in word2vec.
-          The word2vec formula is:
-              p(word) = min(1, sqrt(word.frequency/sampling_factor) / (word.frequency/sampling_factor))
-          We assume that the word frequencies follow Zipf's law (s=1) to derive
-          a numerical approximation of frequency(rank):
-             frequency(rank) ~ 1/(rank * (log(rank) + gamma) + 1/2 - 1/(12*rank))
-          where gamma is the Euler-Mascheroni constant.
-            
-         Parameters:
-        -----------
-        size: int, number of possible words to sample. 
-    """
-
-    gamma = 0.577
-    rank = np.array(list(range(size)))
-    rank[0] = 1
-    inv_fq = rank * (np.log(rank) + gamma) + 0.5 - 1./(12.*rank)
-    f = sampling_factor * inv_fq
-    return np.minimum(1., f / np.sqrt(f))
-
-def skipgrams(sequence, vocabulary_size, 
-              window_size=4, negative_samples=1., shuffle=True, 
-              categorical=False, sampling_table=None):
-    """
-         Parameters:
-         -----------
-         vocabulary_size: int. maximum possible word index + 1
-         window_size: int. actually half-window. The window of a word wi will be [i-window_size, i+window_size+1]
-         negative_samples: float >= 0. 0 for no negative (=random) samples. 1 for same number as positive samples. etc.
-         categorical: bool. if False, labels will be integers (eg. [0, 1, 1 .. ]),  if True labels will be categorical eg. [[1,0],[0,1],[0,1] .. ]
-
-         Returns:
-         --------
-         couples, lables: where `couples` are int pairs and
-             `labels` are either 0 or 1.
- 
-         Notes:
-         ------
-         By convention, index 0 in the vocabulary is a non-word and will be skipped.
-
-    """
-    couples = []
-    labels = []
-    for i, wi in enumerate(sequence):
-        if not wi:
-            continue
-        if sampling_table is not None:
-            if sampling_table[wi] < random.random():
-                continue
-
-        window_start = max(0, i-window_size)
-        window_end = min(len(sequence), i+window_size+1)
-        for j in range(window_start, window_end):
-            if j != i:
-                wj = sequence[j]
-                if not wj:
-                    continue
-                couples.append([wi, wj])
-                if categorical:
-                    labels.append([0,1])
-                else:
-                    labels.append(1)
-
-    return couples, labels
-
-
-def build_model(vocab_size, embed_dim=50, level='word', token_len=15, token_char_vector_dict={},
-                nb_recurrent_layers=3):
-    if level == 'word':
-        pivot_inp = Input(shape=(1, ), dtype='int32', name='pivot')
-        pivot_embed = Embedding(input_dim=vocab_size, output_dim=embed_dim)(pivot_inp)
-
-    elif level == 'char':
-        pivot_inp = Input(shape=(token_len, len(token_char_vector_dict)),
-                                 name='pivot')
-        for i in range(nb_recurrent_layers):
-            if i == 0:
-                curr_input = pivot_inp
-            else:
-                curr_input = curr_out
-
-            l2r = LSTM(output_dim=embed_dim,
-                           return_sequences=True,
-                           activation='tanh')(curr_input)
-            r2l = LSTM(output_dim=embed_dim,
-                           return_sequences=True,
-                           activation='tanh',
-                           go_backwards=True)(curr_input)
-            curr_out = merge([l2r, r2l], name='encoder_'+str(i+1), mode='sum')
-
-        flattened = Flatten()(curr_out)
-        pivot_embed = Dense(embed_dim)(flattened)
-        pivot_embed = Reshape((1, embed_dim))(pivot_embed)
-
-    context_inp = Input(shape=(1, ), dtype='int32', name='context')
-    context_embed = Embedding(input_dim=vocab_size, output_dim=embed_dim)(context_inp)
-    
-    prod = merge([pivot_embed, context_embed], mode='dot', dot_axes=2)
-    res = Reshape((1, ), input_shape=(1, 1))(prod)
-
-    activ = Activation('sigmoid', name='label')(res)
-
-    model = Model(input=[pivot_inp, context_inp], output=activ)
-
-    optim = RMSprop()
-    model.compile(loss='mse', optimizer=optim)
-    return model
-
-def index_characters(tokens):
-    vocab = {ch for tok in tokens for ch in tok.lower()}
-
-    vocab = vocab.union({'$', '|', '%'})
-
-    char_vocab = tuple(sorted(vocab))
-    char_vector_dict, char_idx = {}, {}
-    filler = np.zeros(len(char_vocab), dtype='float32')
-
-    for idx, char in enumerate(char_vocab):
-        ph = filler.copy()
-        ph[idx] = 1
-        char_vector_dict[char] = ph
-        char_idx[idx] = char
-
-    return char_vector_dict, char_idx
-
-def vectorize_token(seq, char_vector_dict, max_len):
-    # cut, if needed:
-    seq = seq[:(max_len - 2)]
-    seq = '%' + seq + '|'
-    seq = seq[::-1] # reverse order (cf. paper)!
-
-    filler = np.zeros(len(char_vector_dict), dtype='float32')
-
-    seq_X = []
-    for char in seq:
-        try:
-            seq_X.append(char_vector_dict[char])
-        except KeyError:
-            seq_X.append(filler)
-    
-    while len(seq_X) < max_len:
-        seq_X.append(filler)
-    
-    return np.array(seq_X, dtype='float32')
-
-def vectorize_tokens(tokens, char_vector_dict, max_len=15):
-    X = []
-    for token in tokens:
-        token = token.lower()
-        x = vectorize_token(seq=token,
-                            char_vector_dict=char_vector_dict,
-                            max_len=max_len)
-        X.append(x)
-
-    return np.asarray(X, dtype='float32')
 
 def main():
     MAX_VOCAB = 6000
@@ -195,11 +31,12 @@ def main():
     NB_EPOCHS = 3
 
     cutoff = 10000000
-    words = codecs.open('../data/Austen_Sense.txt', 'r', encoding='utf8').read().lower().split()[:cutoff]
+    words = codecs.open('../data/Austen_Sense.txt', 'r', encoding='utf8') \
+                  .read().lower().split()[:cutoff]
     print('Loaded', len(words), 'words')
 
     cnt = Counter(words)
-    most_comm = [k for k,v in cnt.most_common(500)]
+    most_comm = [k for k, v in cnt.most_common(500)]
     print('Most frequent:', most_comm[:50])
 
     word_to_int = {'UNK': 0}
@@ -241,15 +78,18 @@ def main():
 
         for idx in range(WINDOW_SIZE, len(words)-WINDOW_SIZE):
             seq = []
-            for w in words[(idx - WINDOW_SIZE) : (idx + WINDOW_SIZE)]:
+            for w in words[(idx - WINDOW_SIZE): (idx + WINDOW_SIZE)]:
                 try:
                     seq.append(word_to_int[w])
                 except KeyError:
                     seq.append(0)
-            
-            couples, labels = skipgrams(seq, len(word_to_int), 
-                                        window_size=4, negative_samples=1., shuffle=True, 
-                                         categorical=False, sampling_table=sampling_table)
+
+            couples, labels = skipgrams(seq, len(word_to_int),
+                                        window_size=4,
+                                        negative_samples=1.,
+                                        shuffle=True,
+                                        categorical=False,
+                                        sampling_table=sampling_table)
 
             if len(couples) > 1:
                 couples = np.array(couples, dtype='int32')
@@ -270,7 +110,8 @@ def main():
 
                 labels = np.array(labels, dtype='int32')
                 
-                loss = model.train_on_batch({'pivot': p_inp, 'context': c_inp}, {'label': labels})
+                loss = model.train_on_batch({'pivot': p_inp, 'context': c_inp},
+                                            {'label': labels})
                 losses.append(loss)
 
                 if idx % 5000 == 0:
@@ -280,7 +121,9 @@ def main():
                     print(np.mean(losses))
 
                     print('Compiling repr func')
-                    get_activations = K.function([model.layers[0].input, K.learning_phase()], [model.layers[6].output,])
+                    get_activations = K.function([model.layers[0].input,
+                                                  K.learning_phase()],
+                                                 [model.layers[6].output, ])
                     activations = get_activations([most_comm_X, 0])[0]
                     activations = np.array(activations, dtype='float32')
 
@@ -290,22 +133,26 @@ def main():
                     # dimension reduction:
                     tsne = TSNE(n_components=2)
                     coor = tsne.fit_transform(norm_weights)
-            
+
                     plt.clf()
                     sns.set_style('dark')
                     sns.plt.rcParams['axes.linewidth'] = 0.4
-                    fig, ax1 = sns.plt.subplots()  
-            
+                    fig, ax1 = sns.plt.subplots()
+
                     labels = most_comm
                     # first plot slices:
-                    x1, x2 = coor[:,0], coor[:,1]
-                    ax1.scatter(x1, x2, 100, edgecolors='none', facecolors='none')
+                    x1, x2 = coor[:, 0], coor[:, 1]
+                    ax1.scatter(x1, x2, 100,
+                                edgecolors='none',
+                                facecolors='none')
                     # clustering on top (add some colouring):
                     clustering = AgglomerativeClustering(linkage='ward',
-                                        affinity='euclidean', n_clusters=10)
+                                                         affinity='euclidean',
+                                                         n_clusters=10)
                     clustering.fit(coor)
                     # add names:
-                    for x, y, name, cluster_label in zip(x1, x2, most_comm, clustering.labels_):
+                    axes = zip(x1, x2, most_comm, clustering.labels_)
+                    for x, y, name, cluster_label in axes:
                         ax1.text(x, y, name, ha='center', va="center",
                                  color=plt.cm.spectral(cluster_label / 10.),
                                  fontdict={'family': 'Arial', 'size': 8})
@@ -317,11 +164,6 @@ def main():
                     ax1.set_yticklabels([])
                     ax1.set_yticks([])
                     sns.plt.savefig('embeddings.pdf', bbox_inches=0)
-
-
-
-
-
 
 """
 # recover the embedding weights trained with skipgram:
@@ -397,4 +239,3 @@ for w in words:
 
 if __name__ == '__main__':
     main()
-
